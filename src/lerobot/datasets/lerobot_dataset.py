@@ -29,6 +29,12 @@ from datasets import concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
+import subprocess
+from typing import Optional, List, Tuple, Dict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+import json
+import os
 
 from lerobot.constants import HF_LEROBOT_HOME
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
@@ -341,6 +347,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        return_video_frames: bool = True,
+        pre_decode_video_frames: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -457,6 +465,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
+        self.return_video_frames = return_video_frames
+        self.pre_decode_video_frames = pre_decode_video_frames
 
         # Unused attributes
         self.image_writer = None
@@ -495,6 +505,97 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+
+        if self.pre_decode_video_frames:
+            ep_indices = list(range(self.meta.total_episodes))
+            # for ep in ep_indices:
+            #     self._episode_worker(ep)
+
+            manifest_entries: List[Dict] = []
+            with ProcessPoolExecutor(max_workers=10) as ex: # TODO: maybe make this not hardcoded to 10 workers
+                futures = [
+                    ex.submit(
+                        self._episode_worker,
+                        ep,
+                    )
+                    for ep in ep_indices
+                ]
+                for fut in tqdm(as_completed(futures), total=len(futures), desc="Pre-Decoding Videos", leave=True):
+                    manifest_entries.append(fut.result())
+
+            manifest = {
+                "repo_id": repo_id,
+                "output_dir": str(self.root / "jpg"),
+                "episodes": sorted(manifest_entries, key=lambda x: x["dir"]),
+            }
+            (self.root / "jpg" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+    def _episode_worker(self, episode_idx: int) -> None:
+        out_root = Path(self.root) / "jpg"
+        out_root.mkdir(parents=True, exist_ok=True)
+        _, _, video_keys = self._discover_keys_from_meta(self.meta)
+        for vkey in video_keys:
+            vid_rel = self.meta.get_video_file_path(ep_index=episode_idx, vid_key=vkey)
+            vid_path = (self.meta.root / vid_rel).resolve()
+            if vid_path.is_file():
+                cam_dir = out_root / f"episode_{episode_idx:06d}" / vkey
+                cam_dir.mkdir(parents=True, exist_ok=True)
+                if not any(cam_dir.iterdir()): # if the directory is empty, extract the frames
+                    self._ffmpeg_extract_jpgs(vid_path, cam_dir)
+        return {
+            "dir": f"episode_{episode_idx:06d}",
+            "videos": video_keys,
+        }
+
+    def _ffmpeg_extract_jpgs(self, video_path: Path, out_dir: Path) -> None:
+        """
+        Use ffmpeg to dump every frame to JPGs. Assumes the mp4 was encoded from episode frames at meta.fps.
+        """
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error",
+            "-y",
+            "-i", str(video_path),
+            "-vsync", "0",
+            "-start_number", "0",
+            "-q:v", "1",
+            "-pix_fmt", "yuvj444p",
+            str(out_dir / "%06d.jpg"),
+        ]
+        subprocess.run(cmd, check=True)
+
+    
+    def _discover_keys_from_meta(meta: LeRobotDatasetMetadata,
+                                fallback_proprio: str = "joint_position",
+                                fallback_action: str = "actions",
+                                fallback_videos: Optional[List[str]] = None
+                                ) -> Tuple[str, str, List[str]]:
+        if fallback_videos is None:
+            fallback_videos = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
+
+        features = getattr(meta, "features", {}) or {}
+        proprio_key = fallback_proprio
+        action_key = fallback_action
+        video_keys = list(meta.video_keys) if hasattr(meta, "video_keys") else fallback_videos
+
+        if isinstance(features, dict) and features:
+            if "joint_position" in features:
+                proprio_key = "joint_position"
+            elif "state" in features:
+                proprio_key = "state"
+
+            if "actions" in features:
+                action_key = "actions"
+            elif "action" in features:
+                action_key = "action"
+
+            # prefer dtype=video from metadata
+            vids = [k for k, v in features.items() if isinstance(v, dict) and v.get("dtype") == "video"]
+            if vids:
+                video_keys = vids
+
+        return proprio_key, action_key, video_keys
 
     def push_to_hub(
         self,
@@ -687,10 +788,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         the main process and a subprocess fails to access it.
         """
         item = {}
-        for vid_key, query_ts in query_timestamps.items():
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+        if self.pre_decode_video_frames:
+            for vid_key, query_ts in query_timestamps.items():
+                frames = []
+                for ts in query_ts:
+                    image_path = self.root / "jpg" / f"episode_{ep_idx:06d}" / vid_key / f"{int(ts*self.fps):06d}.jpg"
+                    frame = torch.from_numpy(np.array(PIL.Image.open(image_path))) / 255.0
+                    frame = frame.permute(2, 0, 1)
+                    frames.append(frame)
+                frames = torch.stack(frames)
+                item[vid_key] = frames.squeeze(0)
+        else:
+            for vid_key, query_ts in query_timestamps.items():
+                video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
+
+                item[vid_key] = frames.squeeze(0)
 
         return item
 
@@ -703,7 +816,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
+        # import pdb; pdb.set_trace()
+        import time
+        t0 = time.time()
         item = self.hf_dataset[idx]
+        t1 = time.time()
+        # print(f"Time to get item 'self.hf_dataset[idx]': {t1 - t0}")
         ep_idx = item["episode_index"].item()
 
         query_indices = None
@@ -714,11 +832,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self.meta.video_keys) > 0:
+        if len(self.meta.video_keys) > 0 and self.return_video_frames:
+            # import pdb; pdb.set_trace()
+            t2 = time.time()
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            t3 = time.time()
+            # print(f"Time to get query_timestamps: {t3 - t2}")
             video_frames = self._query_videos(query_timestamps, ep_idx)
+            t4 = time.time()
+            # print(f"Time to get video_frames: {t4 - t3}")
             item = {**video_frames, **item}
+            t5 = time.time()
+            # print(f"Time to get item: {t5 - t4}")
 
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys

@@ -30,7 +30,7 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
 import subprocess
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Literal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import json
@@ -349,6 +349,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         batch_encoding_size: int = 1,
         return_video_frames: bool = True,
         pre_decode_video_frames: bool = True,
+        history_mode: Literal[
+            "single_tstep_state", 
+            "naive_past_5s_top_camera_state",
+        ] = "single_tstep_state",
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -468,6 +472,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.return_video_frames = return_video_frames
         self.pre_decode_video_frames = pre_decode_video_frames
 
+        self.history_mode = history_mode
+
         # Unused attributes
         self.image_writer = None
         self.episode_buffer = None
@@ -508,8 +514,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if self.pre_decode_video_frames:
             ep_indices = list(range(self.meta.total_episodes))
-            # for ep in ep_indices:
-            #     self._episode_worker(ep)
 
             manifest_entries: List[Dict] = []
             with ProcessPoolExecutor(max_workers=10) as ex: # TODO: maybe make this not hardcoded to 10 workers
@@ -792,7 +796,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for vid_key, query_ts in query_timestamps.items():
                 frames = []
                 for ts in query_ts:
-                    image_path = self.root / "jpg" / f"episode_{ep_idx:06d}" / vid_key / f"{int(ts*self.fps):06d}.jpg"
+                    if isinstance(ts, list):
+                        ts = ts[0]
+                    # int casting default rounding is incorrect behavior, e.g. int(622.999) gives 622, but we want 623
+                    # so use round() to get the correct frame index
+                    image_path = self.root / "jpg" / f"episode_{ep_idx:06d}" / vid_key / f"{int(round(ts*self.fps)):06d}.jpg"
                     frame = torch.from_numpy(np.array(PIL.Image.open(image_path))) / 255.0
                     frame = frame.permute(2, 0, 1)
                     frames.append(frame)
@@ -816,11 +824,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        # import pdb; pdb.set_trace()
-        import time
-        t0 = time.time()
+        # import time
+        # t0 = time.time()
         item = self.hf_dataset[idx]
-        t1 = time.time()
+        # t1 = time.time()
         # print(f"Time to get item 'self.hf_dataset[idx]': {t1 - t0}")
         ep_idx = item["episode_index"].item()
 
@@ -833,17 +840,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 item[key] = val
 
         if len(self.meta.video_keys) > 0 and self.return_video_frames:
-            # import pdb; pdb.set_trace()
-            t2 = time.time()
+            # t2 = time.time()
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            t3 = time.time()
+            # t3 = time.time()
             # print(f"Time to get query_timestamps: {t3 - t2}")
             video_frames = self._query_videos(query_timestamps, ep_idx)
-            t4 = time.time()
+            # t4 = time.time()
             # print(f"Time to get video_frames: {t4 - t3}")
+
             item = {**video_frames, **item}
-            t5 = time.time()
+            # t5 = time.time()
             # print(f"Time to get item: {t5 - t4}")
 
         if self.image_transforms is not None:
